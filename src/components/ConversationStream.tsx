@@ -25,6 +25,7 @@ interface ConversationStreamProps {
   onSourceLangChange: (code: string) => void;
   onTargetLangChange: (code: string) => void;
   onSwapLanguages: () => void;
+  autoDetectLanguage: boolean;
   currentMode: TranslationMode;
   onSelectMode: (mode: TranslationMode) => void;
   fontSize: AppSettings['fontSize'];
@@ -64,7 +65,7 @@ const SAMPLE_PHRASES = [
 export const ConversationStream: React.FC<ConversationStreamProps> = ({
   items, isListening, onToggleListening, audioLevel, audioFrequencies,
   currentInterimSource, currentStreamingTranslation, provisionalTranslation, isTranslating,
-  sourceLang, targetLang, onSourceLangChange, onTargetLangChange, onSwapLanguages,
+  sourceLang, targetLang, onSourceLangChange, onTargetLangChange, onSwapLanguages, autoDetectLanguage,
   currentMode, onSelectMode, fontSize, bilingualDisplay, darkStage,
   onTestSample, onBookmarkItem, onDeleteItem, onClearAll, onOpenShadowing, onSaveVocabulary,
 }) => {
@@ -337,10 +338,19 @@ export const ConversationStream: React.FC<ConversationStreamProps> = ({
             <LangSelect dark={dark} value={sourceLang} onChange={onSourceLangChange} />
             <button
               onClick={onSwapLanguages}
-              title="언어 서로 바꾸기"
-              className={`p-1.5 rounded-lg transition ${dark ? 'text-white/50 hover:bg-white/10' : 'text-gray-400 hover:bg-gray-100'}`}
+              title={autoDetectLanguage ? '언어 서로 바꾸기 (자동 감지 켜짐)' : '언어 서로 바꾸기'}
+              className={`relative p-1.5 rounded-lg transition ${dark ? 'text-white/50 hover:bg-white/10' : 'text-gray-400 hover:bg-gray-100'}`}
             >
               <ArrowRightLeft className="w-3.5 h-3.5" />
+              {autoDetectLanguage && (
+                <span
+                  className={`absolute -top-1 -right-1 text-[7px] font-bold leading-none px-1 py-0.5 rounded-full ${
+                    dark ? 'bg-indigo-400 text-slate-900' : 'bg-indigo-500 text-white'
+                  }`}
+                >
+                  자동
+                </span>
+              )}
             </button>
             <LangSelect dark={dark} value={targetLang} onChange={onTargetLangChange} />
           </div>

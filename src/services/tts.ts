@@ -16,6 +16,9 @@ class TTSService {
    */
   private gate: { onStart: () => void; onEnd: () => void } | null = null;
   private gateDepth = 0;
+  /** Active OpenAI-TTS playback, if any — mutually exclusive with `synth`. */
+  private activeAudio: HTMLAudioElement | null = null;
+  private activeAudioUrl: string | null = null;
 
   constructor() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -127,14 +130,90 @@ class TTSService {
     if (this.synth && (this.synth.speaking || this.synth.pending)) {
       this.synth.cancel();
     }
-    // `cancel()` does not reliably fire `onend` — settle manually.
+    if (this.activeAudio) {
+      this.activeAudio.pause();
+    }
+    // `cancel()`/`pause()` do not reliably fire `onend` — settle manually.
     const settle = this.activeSettle;
     this.activeSettle = null;
     settle?.();
   }
 
   public isSpeaking(): boolean {
-    return this.synth ? this.synth.speaking : false;
+    return (this.synth?.speaking ?? false) || Boolean(this.activeAudio && !this.activeAudio.paused);
+  }
+
+  /**
+   * Higher-quality voice via the OpenAI TTS proxy endpoint. Kept separate from
+   * `speak()` (Web Speech) rather than merged, since it's async/network-backed
+   * and only wired into the single auto-play call site in App.tsx — the
+   * replay button, flashcards and shadowing modal intentionally keep using the
+   * instant, free browser voice.
+   */
+  public async speakOpenAi(
+    text: string,
+    options: {
+      rate?: number;
+      proxyUrl: string;
+      onEnd?: () => void;
+      onError?: (err: unknown) => void;
+    },
+  ): Promise<void> {
+    this.stop();
+
+    const cleanText = text.trim();
+    if (!cleanText) return;
+
+    const proxy = options.proxyUrl.replace(/\/+$/, '');
+    if (!proxy) {
+      options.onError?.(new Error('OpenAI TTS는 번역 프록시 설정이 필요합니다.'));
+      options.onEnd?.();
+      return;
+    }
+
+    let settled = false;
+    const settle = (err?: unknown) => {
+      if (settled) return;
+      settled = true;
+      this.closeGate();
+      if (this.activeAudioUrl) {
+        URL.revokeObjectURL(this.activeAudioUrl);
+        this.activeAudioUrl = null;
+      }
+      this.activeAudio = null;
+      if (err !== undefined) options.onError?.(err);
+      options.onEnd?.();
+    };
+
+    this.openGate();
+    this.activeSettle = settle;
+
+    try {
+      const response = await fetch(`${proxy}/openai/audio/speech`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'tts-1',
+          voice: 'alloy',
+          input: cleanText,
+          speed: Math.min(Math.max(options.rate ?? 1.0, 0.25), 4.0),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`OpenAI TTS 요청 실패 (${response.status})`);
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      this.activeAudioUrl = url;
+      const audio = new Audio(url);
+      this.activeAudio = audio;
+      audio.onended = () => settle();
+      audio.onerror = (event) => settle(event);
+      await audio.play();
+    } catch (err) {
+      settle(err);
+    }
   }
 
   private isKorean(text: string): boolean {

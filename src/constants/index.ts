@@ -8,6 +8,9 @@ export const SUPPORTED_LANGUAGES: LanguageOption[] = [
   { code: 'es', name: 'Español (Spanish)', flag: '🇪🇸', speechCode: 'es-ES' },
   { code: 'fr', name: 'Français (French)', flag: '🇫🇷', speechCode: 'fr-FR' },
   { code: 'de', name: 'Deutsch (German)', flag: '🇩🇪', speechCode: 'de-DE' },
+  { code: 'vi', name: 'Việt (Vietnamese)', flag: '🇻🇳', speechCode: 'vi-VN' },
+  { code: 'th', name: 'ภาษาไทย (Thai)', flag: '🇹🇭', speechCode: 'th-TH' },
+  { code: 'hi', name: 'हिन्दी (Hindi)', flag: '🇮🇳', speechCode: 'hi-IN' },
 ];
 
 export const TRANSLATION_MODES: ModeConfig[] = [
@@ -148,4 +151,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 'base',
   bilingualDisplay: true,
   darkStage: false,
+  autoDetectLanguage: true,
+  autoEngineSwitch: true,
+  sttFallbackEnabled: true,
+  ttsProvider: 'browser',
+  slackWebhookUrl: '',
 };

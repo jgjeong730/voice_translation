@@ -1,26 +1,48 @@
 import React, { useState } from 'react';
-import { 
-  X, 
-  Download, 
-  FileText, 
-  FileCode, 
-  Check, 
-  Copy 
+import {
+  X,
+  Download,
+  FileText,
+  FileCode,
+  FileSpreadsheet,
+  Check,
+  Copy,
+  Sparkles,
+  Send,
+  Loader2,
+  AlertTriangle,
 } from 'lucide-react';
-import type { TranslationItem } from '../types';
+import type { AppSettings, MeetingSummary, TranslationItem } from '../types';
+import { translationService } from '../services/translator';
 
 interface ExportModalProps {
   isOpen: boolean;
   items: TranslationItem[];
+  settings: AppSettings;
   onClose: () => void;
+}
+
+/** Wrap a field in quotes (doubling any inner quote) only when it needs it. */
+function escapeCsvField(value: string): string {
+  if (/[",\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({
   isOpen,
   items,
+  settings,
   onClose,
 }) => {
   const [copied, setCopied] = useState(false);
+  const [summary, setSummary] = useState<MeetingSummary | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [isSendingSlack, setIsSendingSlack] = useState(false);
+  const [slackStatus, setSlackStatus] = useState<'idle' | 'sent' | 'error'>('idle');
+  const [slackError, setSlackError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -54,14 +76,47 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     return md;
   };
 
-  const handleDownloadFile = (type: 'md' | 'txt') => {
-    const content = generateMarkdown();
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8;' });
+  /** Plain prose, unlike `generateMarkdown()` — no `#`/`*` syntax, just readable text. */
+  const generatePlainText = (): string => {
+    let out = `FluentLive 실시간 통번역 기록\n`;
+    out += `일시: ${new Date().toLocaleString()}\n`;
+    out += `총 번역 문장 수: ${items.length}개\n\n`;
+
+    items.forEach((item, idx) => {
+      out += `${idx + 1}. [${item.mode.toUpperCase()}] ${new Date(item.timestamp).toLocaleTimeString()}\n`;
+      out += `원문: ${item.sourceText}\n`;
+      out += `번역: ${item.translatedText}\n\n`;
+    });
+
+    return out;
+  };
+
+  const generateCsv = (): string => {
+    const header = ['#', '시간', '모드', '원문언어', '번역언어', '원문', '번역', '지연(ms)'];
+    const rows = items.map((item, idx) => [
+      String(idx + 1),
+      new Date(item.timestamp).toLocaleString(),
+      item.mode,
+      item.sourceLang,
+      item.targetLang,
+      item.sourceText,
+      item.translatedText,
+      item.latencyMs != null ? String(item.latencyMs) : '',
+    ]);
+
+    return [header, ...rows]
+      .map(row => row.map(escapeCsvField).join(','))
+      .join('\n');
+  };
+
+  const handleDownload = (content: string, extension: string, mimeType: string) => {
+    const blob = new Blob([content], { type: `${mimeType};charset=utf-8;` });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `FluentLive_Transcript_${new Date().toISOString().slice(0, 10)}.${type}`;
+    a.download = `FluentLive_Transcript_${new Date().toISOString().slice(0, 10)}.${extension}`;
     a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleCopyClipboard = () => {
@@ -70,10 +125,47 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleGenerateSummary = async () => {
+    setIsSummarizing(true);
+    setSummaryError(null);
+    setSlackStatus('idle');
+    try {
+      const result = await translationService.generateMeetingSummary(items, settings);
+      setSummary(result);
+    } catch (err) {
+      setSummaryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsSummarizing(false);
+    }
+  };
+
+  const handleSendSlack = async () => {
+    if (!summary) return;
+    setIsSendingSlack(true);
+    setSlackStatus('idle');
+    setSlackError(null);
+    try {
+      const lines = [
+        `*FluentLive 회의 요약* (${new Date().toLocaleString()})`,
+        summary.summary,
+      ];
+      if (summary.actionItems.length > 0) {
+        lines.push('', '*액션 아이템*', ...summary.actionItems.map(a => `• ${a}`));
+      }
+      await translationService.sendSlackNotification(settings.slackWebhookUrl, lines.join('\n'), settings.proxyUrl);
+      setSlackStatus('sent');
+    } catch (err) {
+      setSlackStatus('error');
+      setSlackError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsSendingSlack(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-md">
-      <div className="relative w-full max-w-xl rounded-3xl bg-white border border-gray-200 p-6 sm:p-8 shadow-xl overflow-hidden">
-        
+      <div className="relative w-full max-w-xl rounded-3xl bg-white border border-gray-200 p-6 sm:p-8 shadow-xl overflow-hidden max-h-[90vh] flex flex-col">
+
         {/* Close Button */}
         <button
           onClick={onClose}
@@ -95,36 +187,101 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </div>
         </div>
 
-        {/* Preview Box */}
-        <div className="rounded-2xl bg-gray-50 border border-gray-200 p-4 mb-5 max-h-48 overflow-y-auto font-mono text-xs text-gray-700 whitespace-pre-wrap">
-          {generateMarkdown()}
-        </div>
+        <div className="flex-1 overflow-y-auto pr-1 space-y-5">
+          {/* AI meeting summary */}
+          <div className="rounded-2xl bg-gray-50 border border-gray-200 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
+                <Sparkles className="w-4 h-4 text-purple-600" />
+                <span>AI 회의 요약</span>
+              </div>
+              <button
+                onClick={() => void handleGenerateSummary()}
+                disabled={isSummarizing || items.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-[11px] transition"
+              >
+                {isSummarizing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                <span>{summary ? '다시 생성' : '요약 생성'}</span>
+              </button>
+            </div>
 
-        {/* Action Buttons */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-          <button
-            onClick={() => handleDownloadFile('md')}
-            className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition shadow-lg shadow-indigo-600/30"
-          >
-            <FileCode className="w-4 h-4" />
-            <span>Markdown (.md) 저장</span>
-          </button>
+            {summaryError && (
+              <p className="mt-2 flex items-start gap-1.5 text-[11px] text-rose-700">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <span>{summaryError}</span>
+              </p>
+            )}
 
-          <button
-            onClick={() => handleDownloadFile('txt')}
-            className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs transition border border-gray-200"
-          >
-            <FileText className="w-4 h-4" />
-            <span>텍스트 (.txt) 저장</span>
-          </button>
+            {summary && (
+              <div className="mt-3 space-y-2">
+                <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-wrap">{summary.summary}</p>
+                {summary.actionItems.length > 0 && (
+                  <ul className="text-xs text-gray-700 list-disc pl-4 space-y-0.5">
+                    {summary.actionItems.map((a, i) => <li key={i}>{a}</li>)}
+                  </ul>
+                )}
 
-          <button
-            onClick={handleCopyClipboard}
-            className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs transition border border-gray-200"
-          >
-            {copied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-            <span>{copied ? '복사 완료!' : '클립보드 복사'}</span>
-          </button>
+                {settings.slackWebhookUrl.trim() && (
+                  <div className="pt-1">
+                    <button
+                      onClick={() => void handleSendSlack()}
+                      disabled={isSendingSlack}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-[11px] transition"
+                    >
+                      {isSendingSlack ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                      <span>Slack으로 전송</span>
+                    </button>
+                    {slackStatus === 'sent' && (
+                      <p className="mt-1.5 text-[11px] font-semibold text-emerald-700">Slack에 전송했습니다.</p>
+                    )}
+                    {slackStatus === 'error' && (
+                      <p className="mt-1.5 text-[11px] text-rose-700">{slackError}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Preview Box */}
+          <div className="rounded-2xl bg-gray-50 border border-gray-200 p-4 max-h-48 overflow-y-auto font-mono text-xs text-gray-700 whitespace-pre-wrap">
+            {generateMarkdown()}
+          </div>
+
+          {/* Action Buttons */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <button
+              onClick={() => handleDownload(generateMarkdown(), 'md', 'text/markdown')}
+              className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition shadow-lg shadow-indigo-600/30"
+            >
+              <FileCode className="w-4 h-4" />
+              <span>Markdown</span>
+            </button>
+
+            <button
+              onClick={() => handleDownload(generatePlainText(), 'txt', 'text/plain')}
+              className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs transition border border-gray-200"
+            >
+              <FileText className="w-4 h-4" />
+              <span>텍스트</span>
+            </button>
+
+            <button
+              onClick={() => handleDownload(generateCsv(), 'csv', 'text/csv')}
+              className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs transition border border-gray-200"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              <span>CSV</span>
+            </button>
+
+            <button
+              onClick={handleCopyClipboard}
+              className="flex items-center justify-center gap-2 p-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs transition border border-gray-200"
+            >
+              {copied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+              <span>{copied ? '복사됨!' : '복사'}</span>
+            </button>
+          </div>
         </div>
 
       </div>

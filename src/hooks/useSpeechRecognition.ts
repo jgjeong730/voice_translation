@@ -77,6 +77,14 @@ export function useSpeechRecognition({
   const [errorMessage, setErrorMessage] = useState<string | null>(() =>
     hasSpeechRecognition() ? null : UNSUPPORTED_MESSAGE,
   );
+  /**
+   * True once `'network'` errors (Google's recognition backend unreachable —
+   * common on locked-down corporate networks or in some countries) have fired
+   * repeatedly in a row. A caller can use this to switch to the Whisper
+   * fallback even though the Web Speech API itself is technically supported.
+   */
+  const [persistentNetworkError, setPersistentNetworkError] = useState(false);
+  const networkErrorStreakRef = useRef(0);
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const isListeningRef = useRef(false);
@@ -173,6 +181,10 @@ export function useSpeechRecognition({
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       // A result proves the pipeline is healthy — reset the backoff.
       restartAttemptsRef.current = 0;
+      if (networkErrorStreakRef.current > 0) {
+        networkErrorStreakRef.current = 0;
+        setPersistentNetworkError(false);
+      }
 
       let currentInterim = '';
       let currentFinal = '';
@@ -218,6 +230,10 @@ export function useSpeechRecognition({
 
       if (errorType === 'network') {
         setErrorMessage('음성 인식 서버 연결이 불안정합니다. 재연결 중...');
+        networkErrorStreakRef.current += 1;
+        if (networkErrorStreakRef.current >= 3) {
+          setPersistentNetworkError(true);
+        }
         return;
       }
 
@@ -351,6 +367,8 @@ export function useSpeechRecognition({
     isListeningRef.current = true;
     isSuspendedRef.current = false;
     restartAttemptsRef.current = 0;
+    networkErrorStreakRef.current = 0;
+    setPersistentNetworkError(false);
     setErrorMessage(null);
     setIsListening(true);
 
@@ -414,6 +432,7 @@ export function useSpeechRecognition({
     audioLevel,
     audioFrequencies,
     errorMessage,
+    persistentNetworkError,
     startListening,
     stopListening,
     toggleListening,

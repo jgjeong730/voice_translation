@@ -11,7 +11,11 @@ import {
   Sparkles,
   Zap,
   Monitor,
-  AlertTriangle
+  AlertTriangle,
+  Repeat,
+  Gauge,
+  Mic,
+  Send,
 } from 'lucide-react';
 import type { AppSettings } from '../types';
 import { ENGINE_OPTIONS } from '../constants';
@@ -261,6 +265,63 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* Two-way auto language detection */}
+          <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200 flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
+                <Repeat className="w-4 h-4 text-teal-600" />
+                <span>양방향 자동 언어 감지</span>
+              </div>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                대화 상대가 언어를 바꾸면 다음 발화부터 통역 방향을 자동으로 전환합니다 (스왑 버튼 자동화). AI 엔진(Gemini/OpenAI) 설정이 필요합니다.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={formData.autoDetectLanguage}
+              onChange={(e) => setFormData({ ...formData, autoDetectLanguage: e.target.checked })}
+              className="w-5 h-5 mt-0.5 rounded accent-teal-600 cursor-pointer shrink-0"
+            />
+          </div>
+
+          {/* Latency-based engine auto-switch */}
+          <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200 flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
+                <Gauge className="w-4 h-4 text-orange-500" />
+                <span>지연 시 엔진 자동 전환</span>
+              </div>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Gemini Flash 응답이 계속 느려지면 자동으로 Flash-Lite로 전환하고, 속도가 회복되면 다시 되돌립니다.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={formData.autoEngineSwitch}
+              onChange={(e) => setFormData({ ...formData, autoEngineSwitch: e.target.checked })}
+              className="w-5 h-5 mt-0.5 rounded accent-orange-500 cursor-pointer shrink-0"
+            />
+          </div>
+
+          {/* Whisper STT fallback */}
+          <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200 flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
+                <Mic className="w-4 h-4 text-rose-500" />
+                <span>STT 안정성 폴백 (Whisper)</span>
+              </div>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                브라우저 음성인식이 지원되지 않거나(Safari 등) 반복 실패하면 OpenAI Whisper로 자동 전환합니다. 번역 프록시 설정이 필요하며, 별도 API 사용량 과금이 발생합니다.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={formData.sttFallbackEnabled}
+              onChange={(e) => setFormData({ ...formData, sttFallbackEnabled: e.target.checked })}
+              className="w-5 h-5 mt-0.5 rounded accent-rose-500 cursor-pointer shrink-0"
+            />
+          </div>
+
           {/* Conference screen display */}
           <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200 space-y-3">
             <div className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
@@ -338,6 +399,64 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 className="w-5 h-5 rounded accent-pink-600 cursor-pointer"
               />
             </div>
+
+            {formData.autoTts && (
+              <div>
+                <p className="text-[11px] text-gray-500 mb-1.5">음성 합성(TTS) 엔진</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, ttsProvider: 'browser' })}
+                    className={`p-2.5 rounded-xl border text-left transition ${
+                      formData.ttsProvider === 'browser'
+                        ? 'bg-indigo-50 border-indigo-500 text-gray-900'
+                        : 'bg-white border-gray-200 text-gray-500 hover:border-gray-300'
+                    }`}
+                  >
+                    <span className="text-xs font-bold block">브라우저 기본</span>
+                    <span className="text-[10px] text-gray-500">무료, 즉시 재생</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, ttsProvider: 'openai' })}
+                    className={`p-2.5 rounded-xl border text-left transition ${
+                      formData.ttsProvider === 'openai'
+                        ? 'bg-indigo-50 border-indigo-500 text-gray-900'
+                        : 'bg-white border-gray-200 text-gray-500 hover:border-gray-300'
+                    }`}
+                  >
+                    <span className="text-xs font-bold block">OpenAI 고품질</span>
+                    <span className="text-[10px] text-gray-500">프록시 필요, 사용량 과금</span>
+                  </button>
+                </div>
+                {formData.ttsProvider === 'openai' && !usingProxy && (
+                  <p className="text-[11px] text-amber-700 mt-1.5 flex items-start gap-1">
+                    <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0 text-amber-600" />
+                    <span>번역 프록시가 설정되지 않아 브라우저 기본 음성으로 자동 대체됩니다.</span>
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Slack meeting-summary webhook */}
+          <div className="p-4 rounded-2xl bg-gray-50 border border-gray-200">
+            <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+              <Send className="w-4 h-4 text-emerald-600" />
+              Slack 회의 요약 전송
+            </label>
+            <p className="text-[11px] text-gray-500 mb-2">
+              내보내기 화면에서 생성한 회의 요약을 Slack 채널로 전송할 때 쓰입니다. Slack 앱 → Incoming Webhooks에서 발급받아 붙여넣으세요.
+              이 값은 브라우저에만 저장되며, 전송에는 번역 프록시 설정이 필요합니다(Slack이 브라우저 직접 호출을 CORS로 차단합니다).
+            </p>
+            <input
+              type="url"
+              inputMode="url"
+              placeholder="https://hooks.slack.com/services/..."
+              value={formData.slackWebhookUrl}
+              onChange={(e) => setFormData({ ...formData, slackWebhookUrl: e.target.value })}
+              className="w-full bg-white border border-gray-300 rounded-xl px-3.5 py-2 text-xs text-gray-800 placeholder-gray-400 outline-none focus:border-emerald-500 transition font-mono"
+            />
           </div>
 
           {/* Submit Button */}

@@ -23,8 +23,8 @@ import {
   DEFAULT_SETTINGS,
   ENGINE_OPTIONS,
 } from './constants';
-import { useSpeechRecognition } from './hooks/useSpeechRecognition';
-import { isAbortError, translationService } from './services/translator';
+import { useTranscription } from './hooks/useTranscription';
+import { isAbortError, normalizeProxyUrl, translationService } from './services/translator';
 import { shouldSpeculate, speculationDelayMs } from './utils/interimGate';
 import { RoomChannel, createRoomId, isValidRoomId, readAudienceRoute } from './services/broadcast';
 import type { BroadcastMessage } from './services/broadcast';
@@ -37,6 +37,10 @@ const ROOM_STORAGE_KEY = 'fluentlive_room_id';
 
 /** Minimum gap between mid-stream subtitle pushes to audience windows. */
 const SUBTITLE_STREAM_INTERVAL_MS = 150;
+
+/** Engine auto-switch tuning (flash <-> flash-lite only, see `handleTranslateText`). */
+const ENGINE_LATENCY_THRESHOLD_MS = 3000;
+const ENGINE_SWITCH_COOLDOWN_MS = 20_000;
 
 /**
  * `?view=audience&room=…` opens the read-only subtitle screen instead of the
@@ -132,6 +136,10 @@ function PresenterApp() {
   // Latest history without making the translate callback depend on `items`.
   const itemsRef = useRef<TranslationItem[]>(items);
 
+  // Latency-based engine auto-switch (flash <-> flash-lite only). Hysteresis +
+  // cooldown avoid flapping back and forth on borderline latency.
+  const engineSwitchRef = useRef({ slowStreak: 0, fastStreak: 0, lastSwitchAt: 0 });
+
   // Audience broadcast room. Persisted so a reload does not orphan open
   // audience windows that are already listening on the old id.
   const [roomId, setRoomId] = useState<string>(() => {
@@ -202,6 +210,23 @@ function PresenterApp() {
     };
     roomChannelRef.current?.post(message);
   }, [sourceLang, targetLang, currentMode]);
+
+  /**
+   * Two-way conversation support: after a confirmed translation, ask the LLM
+   * which of the two configured languages the utterance was actually in. If it
+   * doesn't match the current source, flip direction for the *next* turn —
+   * this result is unaffected either way. Best-effort: `detectLanguage` never
+   * throws (see translator.ts), so this can't break the main pipeline.
+   */
+  const maybeFlipDirection = useCallback(async (text: string) => {
+    const srcCode = sourceLang.split('-')[0];
+    const tgtCode = targetLang.split('-')[0];
+    const detected = await translationService.detectLanguage(text, srcCode, tgtCode, settings);
+    if (detected && detected === tgtCode) {
+      setSourceLang(targetLang);
+      setTargetLang(sourceLang);
+    }
+  }, [sourceLang, targetLang, settings]);
 
   // Execute Translation Pipeline
   const handleTranslateText = useCallback(async (text: string) => {
@@ -299,10 +324,51 @@ function PresenterApp() {
       // Auto-TTS — mute the mic while it plays so the app never transcribes
       // its own output back into an endless translate-speak-translate loop.
       if (settings.autoTts) {
-        ttsService.speak(result.translatedText, {
-          lang: targetLang,
-          rate: settings.ttsSpeed || 1.0,
-        });
+        const proxy = normalizeProxyUrl(settings.proxyUrl);
+        if (settings.ttsProvider === 'openai' && (proxy || settings.openaiApiKey)) {
+          void ttsService.speakOpenAi(result.translatedText, {
+            rate: settings.ttsSpeed || 1.0,
+            proxyUrl: proxy,
+          });
+        } else {
+          ttsService.speak(result.translatedText, {
+            lang: targetLang,
+            rate: settings.ttsSpeed || 1.0,
+          });
+        }
+      }
+
+      // Auto-flip direction for the *next* turn if the speaker switched
+      // languages — fire-and-forget, never blocks or affects this result.
+      if (settings.autoDetectLanguage) {
+        void maybeFlipDirection(result.cleanedSourceText || text);
+      }
+
+      // Latency-based engine auto-switch (gemini flash <-> flash-lite only).
+      if (settings.autoEngineSwitch && result.ttftMs != null) {
+        const streak = engineSwitchRef.current;
+        const isSlow = result.ttftMs >= ENGINE_LATENCY_THRESHOLD_MS;
+        const cooledDown = Date.now() - streak.lastSwitchAt > ENGINE_SWITCH_COOLDOWN_MS;
+
+        if (settings.engine === 'gemini-2.5-flash') {
+          streak.slowStreak = isSlow ? streak.slowStreak + 1 : 0;
+          streak.fastStreak = 0;
+          if (streak.slowStreak >= 2 && cooledDown) {
+            streak.slowStreak = 0;
+            streak.lastSwitchAt = Date.now();
+            setSettings(s => ({ ...s, engine: 'gemini-2.5-flash-lite' }));
+            setEngineNotice('네트워크 지연 감지 — 더 빠른 Flash-Lite 엔진으로 전환했습니다.');
+          }
+        } else if (settings.engine === 'gemini-2.5-flash-lite') {
+          streak.fastStreak = isSlow ? 0 : streak.fastStreak + 1;
+          streak.slowStreak = 0;
+          if (streak.fastStreak >= 5 && cooledDown) {
+            streak.fastStreak = 0;
+            streak.lastSwitchAt = Date.now();
+            setSettings(s => ({ ...s, engine: 'gemini-2.5-flash' }));
+            setEngineNotice('응답 속도가 회복되어 Flash 엔진으로 복귀했습니다.');
+          }
+        }
       }
     } catch (err) {
       if (isAbortError(err)) return; // superseded by a newer utterance
@@ -317,7 +383,7 @@ function PresenterApp() {
         lastSpeculatedRef.current = '';
       }
     }
-  }, [sourceLang, targetLang, currentMode, glossary, settings, cancelSpeculation, publishSubtitle]);
+  }, [sourceLang, targetLang, currentMode, glossary, settings, cancelSpeculation, publishSubtitle, maybeFlipDirection]);
 
   /**
    * ★ P1: translate the interim transcript ahead of the final result.
@@ -404,7 +470,8 @@ function PresenterApp() {
     }, delay);
   }, [settings.speculativeTranslation, runSpeculativeTranslation]);
 
-  // Web Speech STT Hook
+  // STT: native Web Speech, or the Whisper proxy fallback when it's unsupported
+  // or failing repeatedly (see useTranscription).
   const {
     isListening,
     audioLevel,
@@ -414,8 +481,10 @@ function PresenterApp() {
     errorMessage,
     suspendListening,
     resumeListening,
-  } = useSpeechRecognition({
+    sttEngine,
+  } = useTranscription({
     lang: sourceLang,
+    settings,
     onInterimTranscript: handleInterimTranscript,
     onFinalTranscript: (finalText) => {
       void handleTranslateText(finalText);
@@ -602,6 +671,16 @@ function PresenterApp() {
         savedCardsCount={savedCards.length}
       />
 
+      {/* Whisper fallback is quietly active — this is informational, not an
+          error, so it gets its own small banner rather than the alert below. */}
+      {sttEngine === 'whisper' && isSupported && !errorMessage && (
+        <div className="w-full max-w-7xl mx-auto px-4 pt-3">
+          <div className="rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-xs text-indigo-700">
+            Whisper 음성인식 폴백 사용 중 (브라우저 기본 인식이 지원되지 않거나 반복 실패했습니다) — OpenAI 사용량이 별도로 발생합니다.
+          </div>
+        </div>
+      )}
+
       {/* ★ P0-6: surface STT / translation failures. These states existed in the
           hook but were never rendered, so unsupported browsers and denied mic
           permissions produced a button that silently did nothing. */}
@@ -666,6 +745,7 @@ function PresenterApp() {
           onSourceLangChange={setSourceLang}
           onTargetLangChange={setTargetLang}
           onSwapLanguages={handleSwapLanguages}
+          autoDetectLanguage={settings.autoDetectLanguage}
           currentMode={currentMode}
           onSelectMode={setCurrentMode}
           fontSize={settings.fontSize}
@@ -729,6 +809,7 @@ function PresenterApp() {
       <ExportModal
         isOpen={isExportOpen}
         items={items}
+        settings={settings}
         onClose={() => setIsExportOpen(false)}
       />
     </div>

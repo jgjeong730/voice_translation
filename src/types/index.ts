@@ -80,6 +80,21 @@ export interface AppSettings {
    * true) do not silently turn the whole app dark.
    */
   darkStage: boolean;
+  /** Auto-flip source/target direction when the detected speech language doesn't match. Requires an AI engine. */
+  autoDetectLanguage: boolean;
+  /** Fall back gemini-2.5-flash -> gemini-2.5-flash-lite (and back) when latency degrades. */
+  autoEngineSwitch: boolean;
+  /** Switch to the Whisper proxy path when Web Speech is unsupported or failing repeatedly. */
+  sttFallbackEnabled: boolean;
+  /** Which engine renders the auto-played translation audio. */
+  ttsProvider: 'browser' | 'openai';
+  /** Slack Incoming Webhook URL for posting the meeting summary. Stored locally only. */
+  slackWebhookUrl: string;
+}
+
+export interface MeetingSummary {
+  summary: string;
+  actionItems: string[];
 }
 
 export interface ModeConfig {

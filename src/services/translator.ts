@@ -1,4 +1,4 @@
-import type { AppSettings, GlossaryItem, LearningDetail, TranslationMode } from '../types';
+import type { AppSettings, GlossaryItem, LearningDetail, MeetingSummary, TranslationItem, TranslationMode } from '../types';
 import { TRANSLATION_MODES } from '../constants';
 import { applyGlossaryToText, formatGlossaryForPrompt, removeDisfluencies, KOREAN_IDIOM_MAP } from '../utils/textCleaner';
 import { readSseStream } from './sseStream';
@@ -129,6 +129,201 @@ export class TranslationService {
   }
 
   /**
+   * Classifies which of two candidate languages a short utterance is in, using
+   * whichever AI engine the user already has configured (downgraded to the
+   * cheapest variant). Used to auto-flip source/target direction in a
+   * back-and-forth conversation without a manual swap.
+   *
+   * Best-effort: any failure (no engine configured, network error, unparseable
+   * reply) resolves to `null` rather than throwing, since "don't flip" is
+   * always a safe fallback and this must never interrupt the main translation.
+   */
+  public async detectLanguage(
+    text: string,
+    candidateA: string,
+    candidateB: string,
+    settings: AppSettings,
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    const proxy = normalizeProxyUrl(settings.proxyUrl);
+    const prompt = `다음 텍스트가 "${candidateA}" 또는 "${candidateB}" 중 어느 언어로 작성되었는지 판단하세요. 반드시 "${candidateA}" 또는 "${candidateB}" 둘 중 하나만, 다른 설명 없이 출력하세요.\n\n텍스트: ${text}`;
+
+    try {
+      if (settings.engine.startsWith('gemini') && (proxy || settings.geminiApiKey)) {
+        const endpoint = proxy
+          ? `${proxy}/gemini/gemini-2.5-flash-lite`
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:streamGenerateContent?alt=sse';
+        const raw = await this.runOneShot(
+          endpoint,
+          proxy ? {} : { 'x-goog-api-key': settings.geminiApiKey },
+          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0, maxOutputTokens: 5 } },
+          'gemini',
+          signal,
+        );
+        return this.pickCandidate(raw, candidateA, candidateB);
+      }
+
+      if (settings.engine === 'gpt-4o-mini' && (proxy || settings.openaiApiKey)) {
+        const endpoint = proxy ? `${proxy}/openai/chat/completions` : 'https://api.openai.com/v1/chat/completions';
+        const raw = await this.runOneShot(
+          endpoint,
+          proxy ? {} : { Authorization: `Bearer ${settings.openaiApiKey}` },
+          { model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], stream: true, max_tokens: 5, temperature: 0 },
+          'openai',
+          signal,
+        );
+        return this.pickCandidate(raw, candidateA, candidateB);
+      }
+
+      return null;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      return null;
+    }
+  }
+
+  /** Match the model's free-text reply back to one of the two candidate codes. */
+  private pickCandidate(raw: string, a: string, b: string): string | null {
+    const cleaned = raw.trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (cleaned === a.toLowerCase() || cleaned.startsWith(a.toLowerCase())) return a;
+    if (cleaned === b.toLowerCase() || cleaned.startsWith(b.toLowerCase())) return b;
+    return null;
+  }
+
+  /**
+   * One-shot (non-interactive-streaming) request: reads the full SSE stream
+   * internally and returns the accumulated text. Shared by detectLanguage and
+   * generateMeetingSummary, neither of which renders token-by-token.
+   */
+  private async runOneShot(
+    endpoint: string,
+    extraHeaders: Record<string, string>,
+    body: Record<string, unknown>,
+    provider: 'gemini' | 'openai',
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json', ...extraHeaders },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(describeApiError(provider === 'gemini' ? 'Gemini' : 'OpenAI', response.status, detail));
+    }
+
+    let out = '';
+    if (response.body) {
+      await readSseStream(response.body, (payload) => {
+        try {
+          const data = JSON.parse(payload);
+          out += provider === 'gemini'
+            ? (data.candidates?.[0]?.content?.parts?.[0]?.text || '')
+            : (data.choices?.[0]?.delta?.content || '');
+        } catch {
+          // Malformed chunk — skip it, don't abort the whole read.
+        }
+      }, signal);
+    }
+    return out;
+  }
+
+  /**
+   * Summarizes the call into a short recap + action items. Requires a real AI
+   * engine — the built-in fallback has no way to synthesize a summary.
+   */
+  public async generateMeetingSummary(
+    items: TranslationItem[],
+    settings: AppSettings,
+    signal?: AbortSignal,
+  ): Promise<MeetingSummary> {
+    if (items.length === 0) {
+      return { summary: '요약할 대화 내용이 없습니다.', actionItems: [] };
+    }
+
+    const proxy = normalizeProxyUrl(settings.proxyUrl);
+    const useGemini = settings.engine.startsWith('gemini') && (proxy || settings.geminiApiKey);
+    const useOpenAi = !useGemini && settings.engine === 'gpt-4o-mini' && (proxy || settings.openaiApiKey);
+
+    if (!useGemini && !useOpenAi) {
+      throw new Error('회의 요약은 Gemini 또는 OpenAI 엔진 설정이 필요합니다 (내장 엔진은 지원하지 않습니다).');
+    }
+
+    // `items` is stored newest-first; the model should read it chronologically.
+    const transcript = [...items].reverse()
+      .map((item, i) => `${i + 1}. [${item.sourceLang} ➔ ${item.targetLang}] ${item.translatedText}`)
+      .join('\n');
+
+    const prompt = `다음은 실시간 통역된 회의/통화 대화록입니다. 이를 바탕으로 (1) 3~6문장의 한국어 요약과 (2) 실행 가능한 액션 아이템 목록을 뽑아주세요.
+반드시 아래 JSON 형식으로만 응답하세요:
+{"summary": "...", "actionItems": ["...", "..."]}
+액션 아이템이 없으면 빈 배열로 응답하세요.
+
+[대화록]
+${transcript}`;
+
+    const raw = useGemini
+      ? await this.runOneShot(
+          proxy ? `${proxy}/gemini/gemini-2.5-flash` : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+          proxy ? {} : { 'x-goog-api-key': settings.geminiApiKey },
+          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 1024 } },
+          'gemini',
+          signal,
+        )
+      : await this.runOneShot(
+          proxy ? `${proxy}/openai/chat/completions` : 'https://api.openai.com/v1/chat/completions',
+          proxy ? {} : { Authorization: `Bearer ${settings.openaiApiKey}` },
+          { model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], stream: true, max_tokens: 1024, temperature: 0.3 },
+          'openai',
+          signal,
+        );
+
+    try {
+      const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleaned) as { summary?: string; actionItems?: unknown };
+      return {
+        summary: parsed.summary || raw,
+        actionItems: Array.isArray(parsed.actionItems)
+          ? parsed.actionItems.filter((s): s is string => typeof s === 'string')
+          : [],
+      };
+    } catch {
+      return { summary: raw, actionItems: [] };
+    }
+  }
+
+  /**
+   * Relays the summary to a Slack Incoming Webhook via the proxy Worker.
+   * A direct browser -> hooks.slack.com call is blocked by CORS (Slack's
+   * webhook endpoint sends no CORS headers), so this always requires a proxy.
+   */
+  public async sendSlackNotification(
+    webhookUrl: string,
+    text: string,
+    proxyUrl: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const proxy = normalizeProxyUrl(proxyUrl);
+    if (!proxy) {
+      throw new Error('Slack 전송은 번역 프록시(Worker) 설정이 필요합니다 (브라우저에서 Slack 웹훅을 직접 호출하면 CORS로 차단됩니다).');
+    }
+
+    const response = await fetch(`${proxy}/notify/slack`, {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhookUrl, text }),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(describeApiError('Slack', response.status, detail));
+    }
+  }
+
+  /**
    * Format recent 2-3 conversation turns for context injection
    */
   private formatHistoryPrompt(history?: ConversationContext[]): string {
@@ -141,9 +336,10 @@ export class TranslationService {
   /**
    * Comprehensive Korean-English Pragmatics, Honorifics & Nuance Engine Guidelines
    */
-  private getPragmaticsGuidance(sourceLang: string, _targetLang: string): string {
+  private getPragmaticsGuidance(sourceLang: string, targetLang: string): string {
     const isKoreanSource = sourceLang.toLowerCase().startsWith('ko');
-    
+    const isKoreanTarget = targetLang.toLowerCase().startsWith('ko');
+
     if (isKoreanSource) {
       return `
 [한국어 ➔ 영어 화용론(Pragmatics) 및 뉘앙스 정밀 복원 지침]:
@@ -178,17 +374,24 @@ export class TranslationService {
 
 4. [자연스러운 구어체 연어(Collocation)]: 직역을 피하고, 원어민이 실제 해당 상황에서 쓰는 생생하고 세련된 표현을 구사하세요.
 `;
-    } else {
+    } else if (isKoreanTarget) {
       return `
-[영어 ➔ 한국어 번역 정밀 뉘앙스 지침]:
-1. [불필요한 인칭대명사 남발 금지]: 영어의 'he, she, it, they'를 기계적으로 '그, 그녀, 그것'으로 직역하지 말고, 주어를 자연스럽게 생략하거나 문맥에 맞는 호칭으로 처리하세요.
-2. [피동문 ➔ 능동문 전환]: 영어의 수동태 표현을 자연스러운 한국어 능동태나 일상 구어체로 다듬으세요.
-3. [영어 관용구 및 구동사 자연스러운 번역]:
-   - "touch base" ➔ "간단히 상황 공유하다 / 연락하다"
-   - "call it a day" ➔ "오늘은 이만 마무리하다"
-   - "under the weather" ➔ "몸 컨디션이 안 좋다"
-   - "bite the bullet" ➔ "이를 악물고 결단을 내리다"
-   - "hit the nail on the head" ➔ "정곡을 찌르다 / 딱 맞추다"
+[외국어 ➔ 한국어 번역 정밀 뉘앙스 지침]:
+1. [불필요한 인칭대명사 남발 금지]: 'he, she, it, they' 등을 기계적으로 '그, 그녀, 그것'으로 직역하지 말고, 주어를 자연스럽게 생략하거나 문맥에 맞는 호칭으로 처리하세요.
+2. [피동문 ➔ 능동문 전환]: 수동태 표현을 자연스러운 한국어 능동태나 일상 구어체로 다듬으세요.
+3. [관용구 및 구동사 자연스러운 번역]: 원문 관용구를 직역하지 말고, 의미가 대응하는 한국어 표현으로 옮기세요.
+   - (영어 예시) "touch base" ➔ "간단히 상황 공유하다 / 연락하다"
+   - (영어 예시) "bite the bullet" ➔ "이를 악물고 결단을 내리다"
+`;
+    } else {
+      // Neither side is Korean (e.g. English↔Vietnamese, Thai↔Hindi) — the two
+      // branches above are Korean-specific and would inject the wrong-language
+      // guidance here, so this stays deliberately generic.
+      return `
+[번역 정밀 뉘앙스 지침]:
+1. 원문을 기계적으로 직역하지 말고, 도착어 원어민이 실제로 쓰는 자연스러운 표현과 어순으로 옮기세요.
+2. 관용구·숙어는 형태가 아니라 의미가 대응하는 도착어 표현으로 현지화하세요.
+3. 생략된 주어/목적어는 문맥상 가장 자연스러운 것으로 복원하고, 수동태는 도착어의 자연스러운 태(능동/수동)로 조정하세요.
 `;
     }
   }

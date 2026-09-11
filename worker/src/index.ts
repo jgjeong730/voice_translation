@@ -38,9 +38,22 @@ const ALLOWED_OPENAI_MODELS = new Set([
   'gpt-4o-mini',
 ]);
 
+const ALLOWED_TTS_MODELS = new Set([
+  'tts-1',
+]);
+
+const ALLOWED_TTS_VOICES = new Set([
+  'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer',
+]);
+
 const MAX_BODY_BYTES = 32_000;
 const MAX_INPUT_CHARS = 4_000;
 const MAX_OUTPUT_TOKENS = 1_024;
+/** Whisper accepts real audio blobs, which dwarf the text-only body cap above. */
+const MAX_AUDIO_BYTES = 10_000_000;
+const MAX_TTS_INPUT_CHARS = 2_000;
+/** Slack's own hard cap on a single message's text. */
+const MAX_SLACK_TEXT_CHARS = 6_000;
 
 /** Requests allowed per IP per window. */
 const RATE_LIMIT = 60;
@@ -143,6 +156,15 @@ export default {
       return json(429, { error: '요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.' }, cors);
     }
 
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, '');
+
+    // Audio upload: multipart/binary, so it must never hit the JSON body
+    // parsing below (`request.text()` would mangle it).
+    if (path === '/openai/audio/transcriptions') {
+      return proxyWhisper(request, env, cors);
+    }
+
     const raw = await request.text();
     if (raw.length > MAX_BODY_BYTES) {
       return json(413, { error: 'Request too large' }, cors);
@@ -155,9 +177,6 @@ export default {
       return json(400, { error: 'Invalid JSON' }, cors);
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, '');
-
     const geminiMatch = path.match(/^\/gemini\/([a-zA-Z0-9.-]+)$/);
     if (geminiMatch) {
       return proxyGemini(geminiMatch[1], payload, env, cors);
@@ -165,6 +184,14 @@ export default {
 
     if (path === '/openai/chat/completions') {
       return proxyOpenAi(payload, env, cors);
+    }
+
+    if (path === '/openai/audio/speech') {
+      return proxyOpenAiTts(payload, env, cors);
+    }
+
+    if (path === '/notify/slack') {
+      return proxySlack(payload, env, cors);
     }
 
     return json(404, { error: 'Not found' }, cors);
@@ -245,8 +272,134 @@ async function proxyOpenAi(
 }
 
 /**
- * Pipe the upstream response straight through. The body is an SSE stream and the
- * client renders it token by token, so it must not be buffered here.
+ * Whisper transcription. Unlike every other route this body is multipart audio,
+ * not JSON, so it bypasses the shared `request.text()`/`JSON.parse` step above
+ * entirely and reads the request its own way.
+ */
+async function proxyWhisper(
+  request: Request,
+  env: Env,
+  cors: Record<string, string>,
+): Promise<Response> {
+  if (!env.OPENAI_API_KEY) {
+    return json(503, { error: 'OpenAI 키가 이 프록시에 설정되어 있지 않습니다.' }, cors);
+  }
+
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return json(400, { error: 'Invalid multipart body' }, cors);
+  }
+
+  const file = form.get('file');
+  if (!(file instanceof Blob)) {
+    return json(400, { error: 'file 필드가 필요합니다.' }, cors);
+  }
+  if (file.size > MAX_AUDIO_BYTES) {
+    return json(413, { error: '오디오 파일이 너무 큽니다.' }, cors);
+  }
+
+  const language = form.get('language');
+
+  const upstreamForm = new FormData();
+  upstreamForm.append('file', file, 'audio.webm');
+  upstreamForm.append('model', 'whisper-1');
+  if (typeof language === 'string' && /^[a-z]{2}$/.test(language)) {
+    upstreamForm.append('language', language);
+  }
+
+  const upstream = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: upstreamForm,
+  });
+
+  return streamBack(upstream, cors);
+}
+
+async function proxyOpenAiTts(
+  payload: Record<string, unknown>,
+  env: Env,
+  cors: Record<string, string>,
+): Promise<Response> {
+  if (!env.OPENAI_API_KEY) {
+    return json(503, { error: 'OpenAI 키가 이 프록시에 설정되어 있지 않습니다.' }, cors);
+  }
+
+  const model = String(payload.model ?? '');
+  if (!ALLOWED_TTS_MODELS.has(model)) {
+    return json(400, { error: `허용되지 않은 모델입니다: ${model}` }, cors);
+  }
+
+  const input = payload.input;
+  if (typeof input !== 'string' || !input.trim()) {
+    return json(400, { error: 'input이 필요합니다.' }, cors);
+  }
+  if (input.length > MAX_TTS_INPUT_CHARS) {
+    return json(413, { error: '입력이 너무 깁니다.' }, cors);
+  }
+
+  const voice = typeof payload.voice === 'string' && ALLOWED_TTS_VOICES.has(payload.voice)
+    ? payload.voice
+    : 'alloy';
+
+  const upstream = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      voice,
+      input,
+      response_format: 'mp3',
+      speed: typeof payload.speed === 'number' ? payload.speed : 1.0,
+    }),
+  });
+
+  return streamBack(upstream, cors);
+}
+
+/**
+ * Relays a summary to a Slack Incoming Webhook. This is the one route that
+ * isn't proxying a paid AI key — it exists purely because Slack's webhook
+ * endpoint doesn't send CORS headers, so a browser can't POST to it directly.
+ * Since the caller supplies the destination URL, it is locked to Slack's own
+ * webhook host so this can't be turned into an open relay to arbitrary URLs.
+ */
+async function proxySlack(
+  payload: Record<string, unknown>,
+  _env: Env,
+  cors: Record<string, string>,
+): Promise<Response> {
+  const webhookUrl = payload.webhookUrl;
+  if (typeof webhookUrl !== 'string' || !/^https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+$/.test(webhookUrl)) {
+    return json(400, { error: 'webhookUrl이 올바른 Slack Incoming Webhook 주소가 아닙니다.' }, cors);
+  }
+
+  const text = payload.text;
+  if (typeof text !== 'string' || !text.trim()) {
+    return json(400, { error: 'text가 필요합니다.' }, cors);
+  }
+  if (text.length > MAX_SLACK_TEXT_CHARS) {
+    return json(413, { error: '메시지가 너무 깁니다.' }, cors);
+  }
+
+  const upstream = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+
+  return json(upstream.ok ? 200 : 502, { ok: upstream.ok }, cors);
+}
+
+/**
+ * Pipe the upstream response straight through unbuffered, preserving whatever
+ * `Content-Type` it came with (SSE text for translate, JSON for Whisper, or
+ * binary audio for TTS) — this is what makes it reusable across all of them.
  */
 function streamBack(upstream: Response, cors: Record<string, string>): Response {
   const headers = new Headers(cors);
