@@ -674,21 +674,7 @@ ${isTutorMode ? 'Respond in JSON with translation, learning details (naturalAlte
     if (matchedIdiom) {
       rawTranslation = matchedIdiom;
     } else {
-      try {
-        const res = await fetch(
-          `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`,
-          { signal: req.signal }
-        );
-        if (res.ok) {
-          const data = await res.json();
-          if (data && data[0]) {
-            rawTranslation = data[0].map((item: unknown[]) => (Array.isArray(item) ? item[0] : '')).join('');
-          }
-        }
-      } catch (e) {
-        if (isAbortError(e)) throw e;
-        console.warn('Translate fetch error:', e);
-      }
+      rawTranslation = await this.fetchPublicTranslate(text, sl, tl, req.signal);
     }
 
     if (!rawTranslation) {
@@ -730,6 +716,43 @@ ${isTutorMode ? 'Respond in JSON with translation, learning details (naturalAlte
       engineUsed: 'builtin',
       fallbackReason,
     };
+  }
+
+  /**
+   * The public (unofficial, undocumented) Google Translate endpoint the
+   * built-in fallback relies on throttles and occasionally drops requests
+   * outright — the previous single-attempt call meant the very next sentence
+   * after a successful one would often come back empty and silently echo the
+   * original text. A couple of short, backed-off retries fix most of that
+   * without adding noticeable delay to the common case (the first attempt has
+   * no delay at all).
+   */
+  private async fetchPublicTranslate(text: string, sl: string, tl: string, signal?: AbortSignal): Promise<string> {
+    const RETRY_DELAYS_MS = [0, 350, 900];
+
+    for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
+      if (RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise(r => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+      }
+      try {
+        const res = await fetch(
+          `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`,
+          { signal }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data) && Array.isArray(data[0]) && data[0].length > 0) {
+            const joined = data[0].map((item: unknown[]) => (Array.isArray(item) ? item[0] : '')).join('');
+            if (joined.trim()) return joined;
+          }
+        }
+      } catch (e) {
+        if (isAbortError(e)) throw e;
+        console.warn(`Public translate fetch failed (attempt ${attempt + 1}/${RETRY_DELAYS_MS.length}):`, e);
+      }
+    }
+
+    return '';
   }
 
   /**
