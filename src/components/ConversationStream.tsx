@@ -339,18 +339,14 @@ export const ConversationStream: React.FC<ConversationStreamProps> = ({
             <button
               onClick={onSwapLanguages}
               title={autoDetectLanguage ? '언어 서로 바꾸기 (자동 감지 켜짐)' : '언어 서로 바꾸기'}
-              className={`relative p-1.5 rounded-lg transition ${dark ? 'text-white/50 hover:bg-white/10' : 'text-gray-400 hover:bg-gray-100'}`}
+              aria-label="언어 서로 바꾸기"
+              className={`p-3 rounded-full border transition active:scale-95 ${
+                dark
+                  ? 'text-white/70 border-white/15 hover:bg-white/10 hover:text-white'
+                  : 'text-gray-500 border-gray-200 hover:bg-gray-100 hover:text-gray-800'
+              }`}
             >
-              <ArrowRightLeft className="w-3.5 h-3.5" />
-              {autoDetectLanguage && (
-                <span
-                  className={`absolute -top-1 -right-1 text-[7px] font-bold leading-none px-1 py-0.5 rounded-full ${
-                    dark ? 'bg-indigo-400 text-slate-900' : 'bg-indigo-500 text-white'
-                  }`}
-                >
-                  자동
-                </span>
-              )}
+              <ArrowRightLeft className="w-5 h-5" />
             </button>
             <LangSelect dark={dark} value={targetLang} onChange={onTargetLangChange} />
           </div>
